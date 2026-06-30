@@ -63,7 +63,7 @@ LLM_PROVIDER: str = "gemini"  # CHANGE FOR PRODUCTION to "vllm"
 # Gemini (local dev) — CHANGE FOR PRODUCTION: move key to a secrets file
 # with restricted file permissions; never commit the real key.
 GEMINI_API_KEY: str = "YOUR_GEMINI_API_KEY_HERE"  # CHANGE FOR PRODUCTION: set via env var or secrets file
-GEMINI_MODEL: str = "gemini-1.5-flash"
+GEMINI_MODEL: str = "gemini-2.5-flash"
 
 # vLLM / OpenAI-compatible endpoint (production on Samsung GPU machine)
 LLM_BASE_URL: str = "http://localhost:8000/v1"  # CHANGE FOR PRODUCTION
