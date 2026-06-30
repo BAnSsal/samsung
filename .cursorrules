@@ -1,0 +1,708 @@
+# Cursor Instructions — Bixby Dashboard AI
+
+> **Paste this into Cursor as project-level rules (`.cursorrules`) or feed it at the start of every agent session.**
+> It tells Cursor exactly what it can and cannot do, what the real data looks like, and how to build locally without BigQuery access.
+
+---
+
+## 1. THE CORE CONSTRAINT — READ THIS FIRST
+
+**You (Cursor) have ZERO access to BigQuery.** The production database is inside Samsung's environment. There is no JSON service account key. Authentication on the real machine uses `gcloud auth application-default login` (ADC), which only works on Samsung's VM. You cannot query, test, or introspect the real database from this local machine.
+
+**What this means for you:**
+
+- NEVER write code that assumes a live BigQuery connection will work locally.
+- NEVER try to `pip install google-cloud-bigquery` and connect during development.
+- NEVER hardcode BigQuery SQL dialect (e.g. `TIMESTAMP_SUB`, `COUNTIF`, `DATE()`) directly in agent logic. All SQL must go through a dialect abstraction layer.
+- ALL local development runs against a **local SQLite database** populated with synthetic data.
+- The code you write will be deployed (without modification) to Samsung's VM, where a config flag switches the database backend from SQLite to BigQuery.
+
+**The only thing that changes between local and production is configuration. If you find yourself writing `if environment == 'local':` inside agent logic, you're doing it wrong. The abstraction should be lower — in the database layer.**
+
+---
+
+## 2. THE REAL BIGQUERY SCHEMA (What Production Actually Looks Like)
+
+This is what exists in Samsung's BigQuery. Your synthetic data must mirror this structure.
+
+### Connection Details
+
+```
+GCP Project:  bixby2-analytics-dev
+Dataset:      bxb4_dw
+Table:        bxb_dw
+Auth:         Application Default Credentials (ADC) — NOT a JSON key
+```
+
+### Table Facts
+
+- **161 columns** total (you only need a subset for the datamarts — see below).
+- **Trillions of rows.** Direct queries without partition filter are rejected by BigQuery.
+- **Partition column:** `yyyymmddhh` (TIMESTAMP type). Every query MUST filter on this column or BigQuery refuses to run it.
+
+### Key Columns (the ones the system actually uses)
+
+| Column             | Type           | Notes                                                                                         |
+| ------------------ | -------------- | --------------------------------------------------------------------------------------------- |
+| `yyyymmddhh`       | TIMESTAMP      | Partition column. Format: `20260615120000` parsed as timestamp. MUST appear in WHERE clause.   |
+| `conversation_id`  | STRING         | Unique per conversation.                                                                      |
+| `execution_result` | ARRAY\<STRING> | **THIS IS AN ARRAY, NOT A SCALAR.** Values include: SUCCESS, EXECUTION_FAILED, EXECUTION_DEEPLINK_REQUESTED, DEVICE_FEATURE_NOT_SUPPORTED, and others. A single conversation can have multiple entries. |
+| `device_id`        | STRING         | Device identifier. NOTE: the datamarts reference `device_type` — this column may need mapping or the real table may have a separate `device_type` column. Flag this as a TODO for the developer to verify on the real schema. |
+| `country`          | STRING         | User's country. The datamarts reference `region` — may be the same column renamed, or may need mapping. Flag as TODO. |
+| `utterance`        | STRING         | What the user said to Bixby.                                                                  |
+
+### Critical Schema Warnings for SQL Generation
+
+1. **`execution_result` is ARRAY\<STRING>, not STRING.**
+
+   The LLD's SQL patterns assume scalar comparison: `COUNTIF(execution_result = 'Success')`. This will NOT work in BigQuery. The correct BigQuery pattern is:
+
+   ```sql
+   -- To count conversations where SUCCESS appears in the array:
+   COUNTIF('SUCCESS' IN UNNEST(execution_result)) AS successful_conversations
+
+   -- To count by each execution result type:
+   SELECT event_type, COUNT(*)
+   FROM `table`, UNNEST(execution_result) AS event_type
+   GROUP BY event_type
+   ```
+
+   In SQLite (local dev), there are no arrays. The synthetic data must represent this as a separate junction table or as a comma-separated string with a different query pattern. **This is the single biggest dialect difference.**
+
+2. **Partition filter is mandatory.**
+
+   BigQuery rejects any query on `bxb_dw` without a `WHERE yyyymmddhh >= ...` clause. The local SQLite won't enforce this, but the dialect layer should still add the filter so the generated SQL is valid when deployed.
+
+   BigQuery pattern:
+   ```sql
+   WHERE yyyymmddhh >= PARSE_TIMESTAMP('%Y%m%d%H',
+         FORMAT_TIMESTAMP('%Y%m%d%H', TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)))
+   ```
+
+3. **The value is 'SUCCESS' (uppercase), not 'Success'.**
+
+   Sample output from real data shows uppercase: SUCCESS, EXECUTION_FAILED. All SQL comparisons must use uppercase.
+
+4. **Success rate from real data is ~35%, not 80/20.**
+
+   The handoff doc suggested 80/20 for synthetic data distributions. Real data shows SUCCESS at roughly 35% of events (after UNNEST). However, note that event count != conversation count because one conversation can produce multiple array entries. The synthetic data should model this distinction.
+
+---
+
+## 3. SCHEMA MISMATCHES TO RESOLVE (TODOs for Developer)
+
+These are gaps between what the LLD assumes and what the real schema shows. The developer must verify these on the Samsung machine and update config accordingly. Until verified, the synthetic data should include BOTH possibilities so the code doesn't break either way.
+
+| LLD Assumes                          | Real Schema Shows         | Action                                                                                                         |
+| ------------------------------------ | ------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `local_timestamp` column             | `yyyymmddhh` column       | The partition column name is different. The bulk build SQL uses `DATE(local_timestamp)` — must change to use `yyyymmddhh` with appropriate date extraction. |
+| `execution_result` is scalar STRING  | ARRAY\<STRING>            | All SQL using `execution_result = 'Success'` must use `UNNEST` + `IN` pattern in BigQuery. Dialect layer must handle this. |
+| `device_type` column                 | `device_id` column visible; `device_type` unknown | Verify if `device_type` exists among the 161 columns. If not, either derive from `device_id` or use a different column. |
+| `region` column                      | `country` column visible  | Verify if `region` exists. If not, use `country` as the geographic dimension in `daily_region_summary`. |
+| `kpi_completion` column (numeric)    | Not confirmed             | The datamarts store `sum_kpi_completion`. Verify this column exists and is numeric. |
+| Conversations have one timestamp     | `yyyymmddhh` is per-event | Verify boundary constraint: can one `conversation_id` span multiple hours/days? If yes, deduplication needed. |
+
+**For synthetic data:** include columns named BOTH ways (e.g., both `country` and `region` as aliases, both `yyyymmddhh` and a derived `local_timestamp`) so code works regardless of which turns out to be correct. The config can then map to the right one.
+
+---
+
+## 4. LOCAL DEVELOPMENT ARCHITECTURE
+
+```
+┌─────────────────────────────────────────────────┐
+│               YOUR LOCAL MACHINE                 │
+│                                                  │
+│  ┌──────────┐   ┌───────────────────────────┐   │
+│  │  Cursor   │──→│  Python Codebase           │   │
+│  │  (IDE)    │   │                           │   │
+│  └──────────┘   │  config.py                 │   │
+│                  │    DB_BACKEND = "sqlite"   │   │
+│                  │    SQLITE_PATH = "local.db"│   │
+│                  │                           │   │
+│                  │  db/                       │   │
+│                  │    dialect.py  ← THE KEY   │   │
+│                  │    bigquery_backend.py     │   │
+│                  │    sqlite_backend.py       │   │
+│                  │                           │   │
+│                  │  synthetic/               │   │
+│                  │    generate.py             │   │
+│                  │    local.db  (generated)   │   │
+│                  │                           │   │
+│                  │  agents/                   │   │
+│                  │    planner.py              │   │
+│                  │    data_wrangler.py        │   │
+│                  │    ...etc                  │   │
+│                  └───────────────────────────┘   │
+│                           │                      │
+│                           ▼                      │
+│                  ┌──────────────┐                │
+│                  │  SQLite DB   │                │
+│                  │  (synthetic  │                │
+│                  │   data)      │                │
+│                  └──────────────┘                │
+└─────────────────────────────────────────────────┘
+
+DEPLOY (code only, no data):
+
+┌─────────────────────────────────────────────────┐
+│            SAMSUNG'S VM (Production)             │
+│                                                  │
+│  Same Python Codebase                            │
+│                                                  │
+│  config.py                                       │
+│    DB_BACKEND = "bigquery"                       │
+│    BQ_PROJECT = "bixby2-analytics-dev"           │
+│    BQ_DATASET = "bxb4_dw"                        │
+│    (auth via ADC — gcloud auth already done)     │
+│                                                  │
+│           │                                      │
+│           ▼                                      │
+│  BigQuery (real data, trillions of rows)         │
+└─────────────────────────────────────────────────┘
+```
+
+---
+
+## 5. THE DIALECT ABSTRACTION LAYER (Most Critical Module)
+
+This is the module that makes the same agent code work on both SQLite and BigQuery. Build this FIRST.
+
+### What It Must Abstract
+
+| Concern                          | BigQuery                                                                                           | SQLite                                                                          |
+| -------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Date subtraction                 | `TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)`                                              | `datetime('now', '-30 days')`                                                   |
+| Current date                     | `CURRENT_DATE()`                                                                                   | `date('now')`                                                                   |
+| Date extraction from timestamp   | `DATE(yyyymmddhh)`                                                                                 | `date(yyyymmddhh)`                                                              |
+| Conditional count                | `COUNTIF(condition)`                                                                               | `SUM(CASE WHEN condition THEN 1 ELSE 0 END)`                                   |
+| Array membership (execution_result) | `'SUCCESS' IN UNNEST(execution_result)`                                                         | Join to a junction table: `EXISTS (SELECT 1 FROM execution_results er WHERE er.conversation_id = t.conversation_id AND er.result = 'SUCCESS')` |
+| Array unnest                     | `FROM table, UNNEST(execution_result) AS event_type`                                               | `FROM execution_results` (separate table)                                       |
+| Table reference                  | `` `project.dataset.table` ``                                                                      | `table`                                                                         |
+| Partition filter (mandatory)     | `WHERE yyyymmddhh >= PARSE_TIMESTAMP(...)` — REQUIRED or query fails                              | No-op (but generate it anyway for SQL validation)                               |
+| INFORMATION_SCHEMA               | `` `project.dataset.INFORMATION_SCHEMA.TABLES` ``                                                  | `sqlite_master WHERE type='table'`                                              |
+| CREATE OR REPLACE TABLE          | Supported natively                                                                                 | `DROP TABLE IF EXISTS` + `CREATE TABLE`                                         |
+| INSERT INTO ... SELECT           | Supported natively                                                                                 | Supported natively                                                              |
+
+### Design Pattern
+
+```python
+# db/dialect.py — SKELETON, not final code
+
+class Dialect:
+    """Base class. Subclass per backend."""
+
+    def table_ref(self, table_name: str) -> str:
+        raise NotImplementedError
+
+    def date_sub(self, days: int) -> str:
+        raise NotImplementedError
+
+    def current_date(self) -> str:
+        raise NotImplementedError
+
+    def countif(self, condition: str) -> str:
+        raise NotImplementedError
+
+    def array_contains(self, array_col: str, value: str) -> str:
+        """Check if an array column contains a value."""
+        raise NotImplementedError
+
+    def partition_filter(self, days_back: int) -> str:
+        """Mandatory partition filter clause."""
+        raise NotImplementedError
+
+    def existence_check_sql(self, table_name: str) -> str:
+        raise NotImplementedError
+
+    def execute(self, sql: str) -> pd.DataFrame:
+        raise NotImplementedError
+
+
+class BigQueryDialect(Dialect):
+    # Implements all methods with BigQuery SQL syntax
+    # Uses google-cloud-bigquery client
+    # Auth via ADC (no JSON key needed)
+    pass
+
+
+class SQLiteDialect(Dialect):
+    # Implements all methods with SQLite syntax
+    # Array handling via junction table joins
+    pass
+```
+
+**The agents NEVER import BigQueryDialect or SQLiteDialect directly.** They import a factory function that reads `config.DB_BACKEND` and returns the right one:
+
+```python
+# db/__init__.py
+from config import DB_BACKEND
+
+def get_dialect() -> Dialect:
+    if DB_BACKEND == "bigquery":
+        from db.bigquery_backend import BigQueryDialect
+        return BigQueryDialect()
+    elif DB_BACKEND == "sqlite":
+        from db.sqlite_backend import SQLiteDialect
+        return SQLiteDialect()
+```
+
+---
+
+## 6. SYNTHETIC DATA DESIGN
+
+### SQLite Schema (Local Mirror)
+
+Since SQLite has no ARRAY type, `execution_result` is modeled as a separate table with a foreign key.
+
+```sql
+-- Main conversations table (mirrors bxb_dw, subset of 161 columns)
+CREATE TABLE bxb_dw (
+    conversation_id TEXT PRIMARY KEY,
+    yyyymmddhh TEXT,          -- ISO timestamp string, mirrors the partition column
+    local_timestamp TEXT,     -- Derived: same as yyyymmddhh, kept for LLD SQL compatibility
+    device_id TEXT,
+    device_type TEXT,         -- May or may not exist in real schema. Include both.
+    country TEXT,
+    region TEXT,              -- May or may not exist in real schema. Include both.
+    utterance TEXT,
+    kpi_completion REAL       -- 0.0 to 1.0
+);
+
+-- Junction table for the ARRAY<STRING> column
+-- In BigQuery this is UNNEST(execution_result); here it's a JOIN.
+CREATE TABLE execution_results (
+    conversation_id TEXT,
+    result TEXT,
+    FOREIGN KEY (conversation_id) REFERENCES bxb_dw(conversation_id)
+);
+CREATE INDEX idx_er_conv ON execution_results(conversation_id);
+CREATE INDEX idx_er_result ON execution_results(result);
+
+-- The 4 datamart rollup tables (built by the Scheduler, same schema locally and in BQ)
+CREATE TABLE daily_kpi_summary (
+    day TEXT,
+    execution_result TEXT,
+    total_conversations INTEGER,
+    sum_kpi_completion REAL
+);
+
+CREATE TABLE daily_device_summary (
+    day TEXT,
+    device_type TEXT,
+    total_conversations INTEGER,
+    successful_conversations INTEGER,
+    sum_kpi_completion REAL
+);
+
+CREATE TABLE hourly_volume_summary (
+    hour_timestamp TEXT,
+    total_conversations INTEGER
+);
+
+CREATE TABLE daily_region_summary (
+    day TEXT,
+    region TEXT,
+    total_conversations INTEGER,
+    successful_conversations INTEGER,
+    sum_kpi_completion REAL
+);
+```
+
+### Synthetic Data Generator Requirements
+
+Create a script `synthetic/generate.py` that:
+
+1. **Generates 50,000–100,000 conversations** spanning 365 days (enough to test trend queries, not so large it's slow).
+
+2. **Uses realistic distributions:**
+
+   | Dimension           | Distribution                                                                                                                     |
+   | ------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+   | Conversations/day   | ~200–400 weekdays, ~100–200 weekends. Add a gradual upward trend over the year.                                                  |
+   | Hour of day         | Peaks at 9–11 AM and 7–9 PM (local usage patterns). Low at 2–5 AM.                                                              |
+   | execution_result array | Each conversation gets 1–3 entries. ~35% of conversations contain SUCCESS (matching real data). ~15% contain EXECUTION_FAILED. ~40% contain EXECUTION_DEEPLINK_REQUESTED. ~8% contain DEVICE_FEATURE_NOT_SUPPORTED. ~2% other. These overlap — one conversation can have both EXECUTION_DEEPLINK_REQUESTED and SUCCESS. |
+   | device_type         | 5–7 types. Top 2 cover ~70% (e.g., "PHONE" 45%, "SPEAKER" 25%, "TV" 12%, "WATCH" 8%, "TABLET" 6%, "CAR" 3%, "OTHER" 1%).        |
+   | country/region      | 8–10 values. India dominant (~60%), then US (~15%), Korea (~10%), rest spread. Map country to region if needed (e.g., India → APAC). |
+   | kpi_completion      | Skewed toward high end: median ~0.75, but with a long left tail. Use beta distribution (a=5, b=2) or similar.                    |
+   | utterance           | 20–30 canned utterances randomly assigned. Not important for testing, just needs to be non-null.                                 |
+
+3. **Populates the junction table** (`execution_results`) from the generated arrays.
+
+4. **Also builds the 4 datamart rollup tables** by running the same aggregation logic the Scheduler would run — so you can test the agents against pre-aggregated data immediately.
+
+5. **Is deterministic** — uses a fixed random seed so results are reproducible.
+
+6. **Writes to `synthetic/local.db`** (SQLite file).
+
+---
+
+## 7. VANNA AI TRAINING — TWO SCRIPTS, SAME PAIRS
+
+### What Vanna Trains On (NOT row data)
+
+Vanna trains on:
+- DDL (CREATE TABLE statements)
+- Business documentation strings (plain English describing what each table/column means)
+- Example question → SQL pairs (hand-written, the most important part)
+
+It does NOT see or store any row-level data. This is why it's safe to train locally with the synthetic schema and retrain on the real schema in production — no sensitive data is involved.
+
+### Two Training Scripts
+
+```
+training/
+    train_local.py       ← Uses SQLite DDL and SQL dialect
+    train_bigquery.py    ← Uses BigQuery DDL and SQL dialect
+    common_pairs.py      ← Shared Q→SQL pair definitions (dialect-parameterized)
+```
+
+`common_pairs.py` defines the question-SQL pairs using dialect placeholders:
+
+```python
+# Example structure — Cursor should generate the full set
+TRAINING_PAIRS = [
+    {
+        "question": "What is the overall success rate?",
+        "sql_bigquery": """
+            SELECT
+                COUNTIF('SUCCESS' IN UNNEST(execution_result)) AS successful,
+                COUNT(*) AS total
+            FROM `{project}.{dataset}.bxb_dw`
+            WHERE yyyymmddhh >= PARSE_TIMESTAMP(...)
+        """,
+        "sql_sqlite": """
+            SELECT
+                SUM(CASE WHEN er.result = 'SUCCESS' THEN 1 ELSE 0 END) AS successful,
+                COUNT(DISTINCT t.conversation_id) AS total
+            FROM bxb_dw t
+            LEFT JOIN execution_results er ON t.conversation_id = er.conversation_id
+        """
+    },
+    {
+        "question": "Trend of success rate over last 30 days",
+        "sql_bigquery": "... targets daily_kpi_summary ...",
+        "sql_sqlite": "... targets daily_kpi_summary (same structure, different date functions) ..."
+    },
+    # ... more pairs covering each datamart's purpose
+]
+```
+
+**Critical training content — Vanna MUST learn these patterns:**
+- Prefer rollup datamarts for trend/aggregate questions, never the raw table.
+- Use UNION ALL with today's raw data when the time range includes today.
+- The additive-counts rule: SUM raw counts first, THEN divide for rates. Never average pre-computed rates.
+
+### Training the Local Instance
+
+```python
+# training/train_local.py
+import vanna
+# Configure Vanna to use local ChromaDB + local LLM endpoint
+# Feed it SQLite DDL from the synthetic database
+# Feed it the sql_sqlite versions of all training pairs
+# Feed it business documentation strings
+```
+
+### Training Production (Run on Samsung VM only)
+
+```python
+# training/train_bigquery.py
+# Same structure, but:
+# - Uses BigQuery DDL introspected from INFORMATION_SCHEMA
+# - Uses sql_bigquery versions of training pairs
+# - Points ChromaDB at production path
+# - Points LLM at the GPU machine's vLLM endpoint
+```
+
+---
+
+## 8. FILE STRUCTURE
+
+```
+bixby-dashboard-ai/
+│
+├── config.py                    # ALL settings. DB_BACKEND flag here.
+│
+├── db/
+│   ├── __init__.py              # get_dialect() factory
+│   ├── dialect.py               # Base Dialect class
+│   ├── bigquery_backend.py      # BigQueryDialect (uses ADC auth, not JSON key)
+│   └── sqlite_backend.py        # SQLiteDialect
+│
+├── synthetic/
+│   ├── generate.py              # Creates local.db with synthetic data
+│   └── local.db                 # Generated SQLite file (git-ignored)
+│
+├── schema/
+│   ├── cache.py                 # Schema Awareness Component
+│   └── schema_cache.json        # Cached schema (generated, git-ignored)
+│
+├── training/
+│   ├── common_pairs.py          # Shared Q→SQL definitions
+│   ├── train_local.py           # Trains Vanna on SQLite schema
+│   └── train_bigquery.py        # Trains Vanna on real BQ schema (run on Samsung VM)
+│
+├── agents/
+│   ├── orchestrator.py          # LangGraph graph definition
+│   ├── planner.py               # Planner Agent
+│   ├── data_wrangler.py         # Data Wrangler Agent (uses Vanna)
+│   ├── diagnose.py              # Diagnose Agent
+│   ├── chart_type.py            # Chart Type Agent (rules, no LLM)
+│   ├── ui_designer.py           # UI Designer Agent (rules, no LLM)
+│   ├── dashboard_codegen.py     # Dashboard Code Gen Agent (Superset API)
+│   ├── insights.py              # Insights Agent
+│   └── scheduler.py             # Scheduler Agent (APScheduler)
+│
+├── api/
+│   └── server.py                # FastAPI app
+│
+├── logs/                        # Daily rotated logs (git-ignored)
+│
+├── chromadb_store/              # Vanna's vector store (git-ignored)
+│
+├── requirements.txt
+├── README.md
+├── LLD.md
+└── .cursorrules                 # THIS FILE
+```
+
+---
+
+## 9. BUILD ORDER (Follow This Sequence)
+
+Each step must work before moving to the next. Do not skip ahead.
+
+### Phase 1 — Foundation (no LLM needed)
+
+```
+Step 1: config.py
+        Define all settings. DB_BACKEND = "sqlite" for local.
+        Rollup table specs with single-source-of-truth names.
+
+Step 2: db/dialect.py + db/sqlite_backend.py
+        Implement the SQLite dialect. Test: can execute raw SQL, handles
+        date functions, handles the array-as-junction-table pattern.
+
+Step 3: synthetic/generate.py
+        Generate local.db. Verify: row counts, distributions, junction table
+        populated, all 4 datamarts built with correct aggregations.
+
+Step 4: schema/cache.py
+        Introspect the SQLite database. Write schema_cache.json.
+        Verify: all tables and columns listed, types correct.
+```
+
+### Phase 2 — Rule-Based Agents (no LLM needed)
+
+```
+Step 5: agents/chart_type.py
+        Feed it hand-built DataFrames of each shape. Verify each rule fires.
+
+Step 6: agents/ui_designer.py
+        Feed it mixed chart lists. Verify 12-column layout math.
+```
+
+### Phase 3 — LLM-Dependent Agents (needs model endpoint)
+
+For local testing, you have two options:
+- Point at a local LLM (if you have one running).
+- Mock the LLM responses to test the wiring. Use a simple mock that returns canned JSON in the expected format.
+
+```
+Step 7: agents/planner.py
+        Test with vague + specific + mixed prompts. Verify sub-question
+        decomposition, pinned chart handling, clarification triggering.
+
+Step 8: training/ + agents/data_wrangler.py
+        Train Vanna locally. Test: "trend of success rate over 30 days"
+        should generate SQL targeting daily_kpi_summary, not bxb_dw.
+
+Step 9: agents/diagnose.py
+        Feed it a broken SQL + error message. Verify one-sentence diagnosis.
+
+Step 10: agents/insights.py
+         Feed it chart data. Verify 2-4 observations with real numbers.
+```
+
+### Phase 4 — Orchestration
+
+```
+Step 11: agents/orchestrator.py
+         Wire all agents into LangGraph. Test happy path end-to-end.
+         (Skip Superset calls — mock them or print the chart configs.)
+
+Step 12: Clarification pause/resume
+         Send ambiguous prompt. Verify pause. Resume with thread_id.
+
+Step 13: Retry/skip branch
+         Force a SQL error. Verify diagnose → retry → eventual skip.
+```
+
+### Phase 5 — External Integrations
+
+```
+Step 14: agents/dashboard_codegen.py
+         Connect to Superset (if available locally). Create one chart.
+
+Step 15: agents/scheduler.py
+         Test all three job types: schema refresh, rollup maintenance,
+         recurring dashboard.
+
+Step 16: api/server.py
+         FastAPI endpoints. Full HTTP round-trip test.
+```
+
+### Phase 6 — Production Prep
+
+```
+Step 17: db/bigquery_backend.py
+         Implement BigQueryDialect. CANNOT test locally — just write it
+         correctly using the schema info from Section 2 above.
+         Uses google-cloud-bigquery with ADC auth:
+             from google.cloud import bigquery
+             client = bigquery.Client()  # ADC auto-discovers credentials
+
+Step 18: training/train_bigquery.py
+         Write it. CANNOT run locally — will be run on Samsung VM.
+
+Step 19: Audit all hardcoded strings
+         Grep for any raw table names, column names, project IDs in
+         agent code. ALL must come from config.py.
+```
+
+---
+
+## 10. RULES FOR CURSOR (Do's and Don'ts)
+
+### DO:
+- Always read from `config.py` for table names, column names, project IDs.
+- Always use `get_dialect()` for any database interaction.
+- Keep all agents database-agnostic — they work with DataFrames, never raw SQL strings.
+- Use pandas DataFrames as the interchange format between agents.
+- Store additive counts in datamarts, compute rates at query time.
+- Use Python's standard `logging` module for audit logs.
+- Handle `execution_result` as an array (junction table in SQLite, UNNEST in BigQuery).
+- Use ADC for BigQuery auth: `bigquery.Client()` with no explicit credentials argument.
+- Make the synthetic data generator deterministic (fixed seed).
+- Write tests that run against the local SQLite database.
+
+### DO NOT:
+- Do NOT install or import Docker, Kubernetes, or any container tooling.
+- Do NOT install Airflow, Prefect, Dagster, Celery, RabbitMQ, or Redis.
+- Do NOT use CrewAI or AutoGen.
+- Do NOT try to connect to BigQuery from the local machine.
+- Do NOT use a JSON service account key for BigQuery auth.
+- Do NOT hardcode SQL dialect (BigQuery functions) in agent code.
+- Do NOT store pre-computed rates in datamarts (store counts, compute rates at query time).
+- Do NOT use multiple LLMs — one model endpoint for everything.
+- Do NOT implement role-based access control.
+- Do NOT create a separate database for audit logs — use plain text log files.
+- Do NOT add `execution_result` as a column in the SQLite `bxb_dw` table — it's a separate junction table locally.
+- Do NOT use `pip install` without `--break-system-packages` flag.
+- Do NOT assume any column name from the LLD is correct — cross-reference with Section 2 (real schema) and Section 3 (mismatches) above.
+
+---
+
+## 11. LLM ENDPOINT CONFIGURATION
+
+All agents share ONE model. The endpoint is OpenAI-compatible (served by vLLM).
+
+```python
+# In config.py:
+LLM_BASE_URL = "http://<gpu-machine-ip>:8000/v1"  # vLLM OpenAI-compatible endpoint
+LLM_MODEL_NAME = "gpt-oss-20b"                     # Model name as registered in vLLM
+
+# For local dev without a GPU machine, either:
+# - Point at any OpenAI-compatible local model (ollama, llama.cpp server, etc.)
+# - Use a mock that returns canned JSON responses
+# - Use an API key to a cloud model temporarily (but don't commit the key)
+```
+
+Vanna, LangGraph agents, and the Insights agent all call the same endpoint. Vanna is configured with a custom LLM class that points at this URL. The agents use the OpenAI Python client library pointed at this URL.
+
+---
+
+## 12. BIGQUERY AUTH — HOW IT WORKS IN PRODUCTION
+
+On Samsung's VM, the developer has already run:
+
+```bash
+gcloud auth application-default login
+```
+
+This stores credentials at a known path. The `google-cloud-bigquery` library automatically discovers them. The Python code is simply:
+
+```python
+from google.cloud import bigquery
+client = bigquery.Client(project="bixby2-analytics-dev")
+# That's it. No JSON key, no explicit credentials path.
+```
+
+The `bigquery_backend.py` module uses exactly this pattern. No environment variable for credentials needed — ADC handles it.
+
+---
+
+## 13. SUPERSET INTERACTION PATTERN
+
+The Dashboard Code Gen Agent communicates with Superset via its REST API. Key operations:
+
+1. POST `/api/v1/security/login` → get access token
+2. GET `/api/v1/security/csrf_token/` → get CSRF token
+3. POST `/api/v1/dataset/` → create virtual dataset (the SQL is the chart's query)
+4. POST `/api/v1/chart/` → create chart linked to the dataset
+5. POST `/api/v1/dashboard/` → create empty dashboard
+6. PUT `/api/v1/dashboard/{id}` → attach position JSON with chart layout
+
+All Superset connection details (URL, credentials, database ID) come from `config.py`.
+
+For local development without Superset, mock these calls and print the chart configs that would have been sent. The mock should validate the JSON structure matches Superset's expected format.
+
+---
+
+## 14. TESTING STRATEGY
+
+Since you can't test against BigQuery, testing is layered:
+
+| Layer                   | What It Tests                                                            | How                                               |
+| ----------------------- | ------------------------------------------------------------------------ | -------------------------------------------------- |
+| Unit tests              | Each agent in isolation                                                  | pytest with hand-built inputs                      |
+| Dialect tests           | SQL generation for both backends                                         | Generate SQL via both dialects, verify syntax       |
+| Integration tests       | Full orchestrator flow against SQLite                                     | End-to-end with synthetic data                     |
+| SQL validation tests    | Generated BigQuery SQL is syntactically valid                            | Parse with sqlglot or similar (don't execute)      |
+| Datamart math tests     | Additive counts produce correct rates                                    | Known data → known expected rates                  |
+| Training pair tests     | Both SQL variants of each training pair execute against their database   | SQLite pairs run against local.db                  |
+
+**Do NOT write tests that require a BigQuery connection.** Every test must pass on the local machine using SQLite.
+
+---
+
+## 15. DEPLOYMENT CHECKLIST (What Happens on Samsung's VM)
+
+This is not for Cursor to execute — this is documentation for the developer when they deploy.
+
+```
+1. Copy the codebase to the VM (git clone or scp). No data files — only code.
+2. pip install -r requirements.txt --break-system-packages
+3. Edit config.py:
+     DB_BACKEND = "bigquery"
+     BQ_PROJECT = "bixby2-analytics-dev"
+     BQ_DATASET = "bxb4_dw"
+     LLM_BASE_URL = "http://<gpu-machine>:8000/v1"
+     SUPERSET_URL = "http://<superset-host>:8088"
+4. Verify ADC: gcloud auth application-default login (if not already done)
+5. Run schema introspection: python -m schema.cache
+     → Verify schema_cache.json lists bxb_dw and all 161 columns
+     → CHECK: does device_type column exist? does region column exist?
+     → UPDATE config.py column mappings based on actual schema
+6. Run Vanna BigQuery training: python training/train_bigquery.py
+7. Trigger bulk build of all 4 datamarts: python -m agents.scheduler --bulk-build
+     → This scans the full raw table. WILL BE SLOW AND EXPENSIVE. Run once.
+8. Register systemd service. Start the API server.
+9. Test: curl -X POST http://localhost:8000/generate-dashboard \
+     -d '{"prompt": "show me the KPI trends for last 7 days"}'
+10. Verify Superset dashboard appears with correct data.
+```
+
+---
+
+End of Cursor instructions.

@@ -1,0 +1,38 @@
+# Generated / runtime files — never commit these
+synthetic/local.db
+chromadb_store/
+schema/schema_cache.json
+logs/
+schedules/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Secrets and credentials
+.env
+secrets/
+*.json.key
+gcloud_credentials.json
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
